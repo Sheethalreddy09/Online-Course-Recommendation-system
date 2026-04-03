@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+tensorflow
+pandas
+scikit-learn
+gradio
+requests
