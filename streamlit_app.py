@@ -165,8 +165,7 @@ def init_state() -> None:
         "new_user_created_id": None,
         "existing_user_input": "",
         "existing_user_select": None,
-        "search_input": "",
-        "search_select": None,
+        "search_value": None,
         "new_user_input": "",
         "new_user_select": None,
         "new_user_exact_selection": None,
@@ -186,8 +185,7 @@ def reset_existing_user() -> None:
 
 
 def reset_search() -> None:
-    st.session_state["search_input"] = ""
-    st.session_state["search_select"] = None
+    st.session_state["search_value"] = None
     st.session_state["search_status"] = ""
     st.session_state["search_results"] = pd.DataFrame()
 
@@ -289,46 +287,45 @@ with tab_existing:
 
 with tab_search:
     st.subheader("Course Search")
-    st.write("Enter a course keyword directly, or choose from matching suggestions.")
+    st.write("Type inside the dropdown to see course suggestions in the same field.")
 
-    col_input, col_select = st.columns([1, 1])
+    current_search_value = st.session_state["search_value"] or ""
+    search_suggestions = get_course_suggestions(current_search_value)
 
-    with col_input:
-        st.text_input("Enter Course / Keyword", key="search_input")
-
-    search_suggestions = get_course_suggestions(st.session_state["search_input"])
-
-    with col_select:
-        if search_suggestions:
-            st.selectbox(
-                "Matching Courses",
-                options=search_suggestions,
-                index=None,
-                placeholder="Select a suggested course",
-                key="search_select",
-            )
-        else:
-            st.session_state["search_select"] = None
-            st.caption("No course suggestions yet.")
+    st.selectbox(
+        "Enter Course / Keyword",
+        options=search_suggestions,
+        index=None,
+        placeholder="Type a course keyword here",
+        accept_new_options=True,
+        key="search_value",
+    )
 
     col_action, col_reset = st.columns([1, 1])
     with col_action:
         if st.button("Search Courses", use_container_width=True):
-            course_value = st.session_state["search_select"] or st.session_state["search_input"]
+            course_value = st.session_state["search_value"]
             if not str(course_value).strip():
                 st.session_state["search_status"] = "Please enter a course keyword."
                 st.session_state["search_results"] = pd.DataFrame()
             else:
-                try:
-                    data = post_json("/search", {"query": course_value})
-                    results = to_df(data.get("results", []))
+                current_suggestions = get_course_suggestions(str(course_value))
+                if not current_suggestions:
                     st.session_state["search_status"] = (
-                        f"Found {len(results)} matching courses for: {course_value}"
+                        f"No matching course suggestions found for: {course_value}"
                     )
-                    st.session_state["search_results"] = results
-                except Exception as exc:
-                    st.session_state["search_status"] = f"Error: {exc}"
                     st.session_state["search_results"] = pd.DataFrame()
+                else:
+                    try:
+                        data = post_json("/search", {"query": course_value})
+                        results = to_df(data.get("results", []))
+                        st.session_state["search_status"] = (
+                            f"Found {len(results)} matching courses for: {course_value}"
+                        )
+                        st.session_state["search_results"] = results
+                    except Exception as exc:
+                        st.session_state["search_status"] = f"Error: {exc}"
+                        st.session_state["search_results"] = pd.DataFrame()
 
     with col_reset:
         if st.button("Reset Course Search", use_container_width=True):
