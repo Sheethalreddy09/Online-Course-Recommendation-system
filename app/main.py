@@ -68,13 +68,14 @@ expected_columns = ["user_id", "course_name", "instructor", "difficulty_level", 
 if os.path.exists(NEW_USERS_PATH):
     new_users_df = pd.read_csv(NEW_USERS_PATH)
 
-    # if old schema exists, recreate with new schema
-    if set(new_users_df.columns) != expected_columns:
+    # If the CSV has the same columns in a different order, keep the data and reorder it.
+    # Recreate only when the schema is genuinely different.
+    if set(new_users_df.columns) != set(expected_columns):
         print("Old new_users.csv schema detected. Recreating with new schema...")
         new_users_df = pd.DataFrame(columns=expected_columns)
         new_users_df.to_csv(NEW_USERS_PATH, index=False)
     else:
-        new_users_df = new_users_df[excepted_columns]
+        new_users_df = new_users_df[expected_columns]
         if not new_users_df.empty:
             new_users_df["user_id"] = new_users_df["user_id"].astype(int)
             new_users_df["course_name"] = new_users_df["course_name"].astype(str)
@@ -400,7 +401,9 @@ def suggest_users(request: UserSuggestRequest):
     if not prefix:
         return {"suggestions": []}
 
-    user_ids = df["user_id"].drop_duplicates().astype(str)
+    base_user_ids = df["user_id"].drop_duplicates()
+    new_user_ids = new_users_df["user_id"].drop_duplicates() if not new_users_df.empty else pd.Series(dtype=int)
+    user_ids = pd.concat([base_user_ids, new_user_ids], ignore_index=True).drop_duplicates().astype(str)
     matched = user_ids[user_ids.str.startswith(prefix)].head(20).tolist()
     return {"suggestions": matched}
 
@@ -437,8 +440,9 @@ def recommend_courses(request: RecommendRequest):
     top_n = 5
 
     user_row = df[df["user_id"] == user_id]
+    new_user_row = new_users_df[new_users_df["user_id"] == user_id]
 
-    if user_row.empty:
+    if user_row.empty and new_user_row.empty:
         return {
             "message": (
                 f"No user found with user_id '{user_id}'. "
@@ -450,11 +454,19 @@ def recommend_courses(request: RecommendRequest):
             "recommendations": []
         }
 
-    taken_courses = df[df["user_id"] == user_id][[
-        "course_name", "instructor", "difficulty_level", "rating"
-    ]].drop_duplicates().to_dict(orient="records")
+    if not user_row.empty:
+        taken_courses = df[df["user_id"] == user_id][[
+            "course_name", "instructor", "difficulty_level", "rating"
+        ]].drop_duplicates().to_dict(orient="records")
 
-    recommendations = recommend_top_courses_for_user(model, user_id, df, top_n=top_n)
+        recommendations = recommend_top_courses_for_user(model, user_id, df, top_n=top_n)
+    else:
+        taken_courses = new_user_row[[
+            "course_name", "instructor", "difficulty_level", "rating"
+        ]].drop_duplicates().to_dict(orient="records")
+
+        selected_course_name = str(new_user_row["course_name"].iloc[0])
+        recommendations = recommend_related_from_selected_course(selected_course_name, top_n=top_n)
 
     return {
         "user_id": user_id,
