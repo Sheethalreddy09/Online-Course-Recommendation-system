@@ -7,6 +7,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 from difflib import get_close_matches
 import os
 import re
+import json
+import tempfile
+import zipfile
 
 app = FastAPI(
     title="Online Course Recommendation API",
@@ -33,11 +36,50 @@ NEW_USERS_PATH = os.path.join(DATA_DIR, "new_users.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
+
+def _remove_unsupported_keras_fields(obj):
+    if isinstance(obj, dict):
+        cleaned = {}
+        for key, value in obj.items():
+            # Some saved Keras model archives include fields that older/newer
+            # loaders reject even when they are null. Strip them before loading.
+            if key == "quantization_config":
+                continue
+            cleaned[key] = _remove_unsupported_keras_fields(value)
+        return cleaned
+
+    if isinstance(obj, list):
+        return [_remove_unsupported_keras_fields(item) for item in obj]
+
+    return obj
+
+
+def load_compatible_keras_model(model_path: str):
+    with zipfile.ZipFile(model_path, "r") as src_zip:
+        config = json.loads(src_zip.read("config.json"))
+        cleaned_config = _remove_unsupported_keras_fields(config)
+
+        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as temp_file:
+            temp_model_path = temp_file.name
+
+        with zipfile.ZipFile(temp_model_path, "w") as dst_zip:
+            for info in src_zip.infolist():
+                if info.filename == "config.json":
+                    dst_zip.writestr(info, json.dumps(cleaned_config))
+                else:
+                    dst_zip.writestr(info, src_zip.read(info.filename))
+
+    try:
+        return tf.keras.models.load_model(temp_model_path, compile=False)
+    finally:
+        if os.path.exists(temp_model_path):
+            os.remove(temp_model_path)
+
 # =====================================================
 # Load Artifacts
 # =====================================================
 print("Loading deep learning model...")
-model = tf.keras.models.load_model(MODEL_PATH)
+model = load_compatible_keras_model(MODEL_PATH)
 
 print("Loading encoders...")
 with open(USER_ENCODER_PATH, "rb") as f:
