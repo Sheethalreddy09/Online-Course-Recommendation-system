@@ -163,6 +163,7 @@ def init_state() -> None:
         "new_user_summary": "",
         "new_user_related": pd.DataFrame(),
         "new_user_created_id": None,
+        "pending_existing_user_input": None,
         "existing_user_input": "",
         "existing_user_select": None,
         "search_value": None,
@@ -205,6 +206,13 @@ st.set_page_config(
 )
 
 init_state()
+
+if st.session_state["pending_existing_user_input"] is not None:
+    pending_user_id = str(st.session_state["pending_existing_user_input"])
+    st.session_state["existing_user_input"] = pending_user_id
+    st.session_state["existing_user_select"] = None
+    st.session_state["pending_existing_user_input"] = None
+
 backend_info = get_backend()
 healthy, health_message = backend_health(backend_info)
 
@@ -436,8 +444,7 @@ with tab_new_user:
                 new_user_id = data.get("new_user_id")
 
                 st.session_state["new_user_created_id"] = new_user_id
-                st.session_state["existing_user_input"] = str(new_user_id)
-                st.session_state["existing_user_select"] = str(new_user_id)
+                st.session_state["pending_existing_user_input"] = str(new_user_id)
                 st.session_state["new_user_summary"] = (
                     f"New User ID: {new_user_id}\n"
                     f"Course Name: {selected.get('course_name')}\n"
@@ -447,6 +454,7 @@ with tab_new_user:
                     f"{data.get('message', '')}"
                 )
                 st.session_state["new_user_related"] = to_df(data.get("related_recommendations", []))
+                st.rerun()
             except Exception as exc:
                 st.session_state["new_user_summary"] = f"Error: {exc}"
                 st.session_state["new_user_related"] = pd.DataFrame()
