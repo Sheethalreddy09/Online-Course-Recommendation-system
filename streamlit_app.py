@@ -1,7 +1,4 @@
 import os
-import subprocess
-import sys
-import time
 from typing import Any
 
 import pandas as pd
@@ -9,7 +6,7 @@ import requests
 import streamlit as st
 
 
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8001")
+API_BASE_URL = os.getenv("API_BASE_URL", "").strip()
 
 
 def beautify_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -39,67 +36,82 @@ def to_df(data: Any) -> pd.DataFrame:
     return beautify_df(pd.DataFrame(data))
 
 
-def backend_health() -> tuple[bool, str]:
-    try:
-        response = requests.get(f"{API_BASE_URL}/health", timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        return True, f"Backend Connected | Status: {data.get('status')} | Model: {data.get('model')}"
-    except Exception as exc:
-        return False, f"Backend Not Reachable | Error: {exc}"
-
-
 @st.cache_resource(show_spinner=False)
-def ensure_backend_running() -> dict[str, Any]:
-    is_healthy, message = backend_health()
-    if is_healthy:
-        return {"started": False, "message": message}
-
-    project_root = os.path.dirname(os.path.abspath(__file__))
-
-    try:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "uvicorn",
-                "app.main:app",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "8001",
-            ],
-            cwd=project_root,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as exc:
-        return {
-            "started": False,
-            "message": f"Unable to start backend automatically. Error: {exc}",
-        }
-
-    for _ in range(40):
-        time.sleep(1)
-        is_healthy, message = backend_health()
-        if is_healthy:
+def get_backend() -> dict[str, Any]:
+    if API_BASE_URL:
+        try:
+            response = requests.get(f"{API_BASE_URL}/health", timeout=5)
+            response.raise_for_status()
+            data = response.json()
             return {
-                "started": True,
-                "pid": process.pid,
-                "message": message,
+                "mode": "api",
+                "message": (
+                    f"Backend Connected via API | Status: {data.get('status')} | "
+                    f"Model: {data.get('model')}"
+                ),
+            }
+        except Exception as exc:
+            return {
+                "mode": "error",
+                "message": f"Configured API backend is not reachable at {API_BASE_URL}. Error: {exc}",
             }
 
-    return {
-        "started": True,
-        "pid": process.pid,
-        "message": "Backend process started, but health check is still pending.",
-    }
+    try:
+        from app import main as backend_module
+
+        data = backend_module.health_check()
+        return {
+            "mode": "inprocess",
+            "backend": backend_module,
+            "message": (
+                f"Backend Loaded In-Process | Status: {data.get('status')} | "
+                f"Model: {data.get('model')}"
+            ),
+        }
+    except Exception as exc:
+        return {
+            "mode": "error",
+            "message": f"Unable to load backend module. Error: {exc}",
+        }
+
+
+def backend_health(backend_info: dict[str, Any]) -> tuple[bool, str]:
+    if backend_info["mode"] in {"api", "inprocess"}:
+        return True, backend_info["message"]
+    return False, backend_info["message"]
 
 
 def post_json(path: str, payload: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
-    response = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+    backend_info = get_backend()
+
+    if backend_info["mode"] == "api":
+        response = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    if backend_info["mode"] != "inprocess":
+        raise RuntimeError(backend_info["message"])
+
+    backend = backend_info["backend"]
+
+    try:
+        if path == "/suggest-users":
+            return backend.suggest_users(backend.UserSuggestRequest(**payload))
+        if path == "/suggest-courses":
+            return backend.suggest_courses(backend.CourseSuggestRequest(**payload))
+        if path == "/recommend":
+            return backend.recommend_courses(backend.RecommendRequest(**payload))
+        if path == "/search":
+            return backend.search_courses(backend.SearchRequest(**payload))
+        if path == "/search-new-user-course":
+            return backend.search_new_user_course(backend.SearchRequest(**payload))
+        if path == "/create-new-user":
+            return backend.create_new_user(backend.CreateNewUserRequest(**payload))
+    except Exception as exc:
+        detail = getattr(exc, "detail", str(exc))
+        raise RuntimeError(detail) from exc
+
+    raise RuntimeError(f"Unsupported backend path: {path}")
 
 
 def get_user_suggestions(prefix: str) -> list[str]:
@@ -197,8 +209,8 @@ st.set_page_config(
 )
 
 init_state()
-backend_info = ensure_backend_running()
-healthy, health_message = backend_health()
+backend_info = get_backend()
+healthy, health_message = backend_health(backend_info)
 
 st.title("Online Course Recommendation System")
 st.caption("Enhanced Embedding + Smart Search + New User Onboarding")
@@ -206,11 +218,8 @@ st.caption("Enhanced Embedding + Smart Search + New User Onboarding")
 if healthy:
     st.success(health_message)
 else:
-    st.warning(backend_info.get("message", health_message))
-    st.info(
-        "If the backend does not become healthy, start it manually with "
-        "`uvicorn app.main:app --host 127.0.0.1 --port 8001`."
-    )
+    st.error(health_message)
+    st.stop()
 
 tab_existing, tab_search, tab_new_user = st.tabs(
     ["Existing User Recommendation", "Course Search", "New User Onboarding"]
