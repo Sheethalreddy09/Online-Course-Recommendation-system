@@ -166,8 +166,7 @@ def init_state() -> None:
         "existing_user_input": "",
         "existing_user_select": None,
         "search_value": None,
-        "new_user_input": "",
-        "new_user_select": None,
+        "new_user_value": None,
         "new_user_exact_selection": None,
     }
 
@@ -191,8 +190,7 @@ def reset_search() -> None:
 
 
 def reset_new_user() -> None:
-    st.session_state["new_user_input"] = ""
-    st.session_state["new_user_select"] = None
+    st.session_state["new_user_value"] = None
     st.session_state["new_user_status"] = ""
     st.session_state["new_user_matches"] = pd.DataFrame()
     st.session_state["new_user_exact_choices"] = []
@@ -340,54 +338,55 @@ with tab_search:
 with tab_new_user:
     st.subheader("New User Flow")
     st.write(
-        "Search for a course first, review the matched rows, then choose one exact course to create a new user."
+        "Type inside the dropdown to see course suggestions in the same field, then choose one exact course."
     )
 
-    col_input, col_select = st.columns([1, 1])
+    current_new_user_value = st.session_state["new_user_value"] or ""
+    new_user_suggestions = get_course_suggestions(current_new_user_value)
 
-    with col_input:
-        st.text_input("Enter Course / Keyword for New User", key="new_user_input")
-
-    new_user_suggestions = get_course_suggestions(st.session_state["new_user_input"])
-
-    with col_select:
-        if new_user_suggestions:
-            st.selectbox(
-                "Matching Course Suggestions",
-                options=new_user_suggestions,
-                index=None,
-                placeholder="Select a suggested course",
-                key="new_user_select",
-            )
-        else:
-            st.session_state["new_user_select"] = None
-            st.caption("No course suggestions yet.")
+    st.selectbox(
+        "Enter Course / Keyword for New User",
+        options=new_user_suggestions,
+        index=None,
+        placeholder="Type a course keyword here",
+        accept_new_options=True,
+        key="new_user_value",
+    )
 
     col_search, col_reset = st.columns([1, 1])
     with col_search:
         if st.button("Search Course For New User", use_container_width=True):
-            course_value = st.session_state["new_user_select"] or st.session_state["new_user_input"]
+            course_value = st.session_state["new_user_value"]
             if not str(course_value).strip():
                 st.session_state["new_user_status"] = "Please enter a course keyword."
                 st.session_state["new_user_matches"] = pd.DataFrame()
                 st.session_state["new_user_exact_choices"] = []
                 st.session_state["new_user_exact_selection"] = None
             else:
-                try:
-                    data = post_json("/search-new-user-course", {"query": course_value})
-                    matched_df = to_df(data.get("matched_courses", []))
-                    st.session_state["new_user_matches"] = matched_df
-                    st.session_state["new_user_exact_choices"] = build_exact_course_choices(matched_df)
-                    st.session_state["new_user_exact_selection"] = None
+                current_suggestions = get_course_suggestions(str(course_value))
+                if not current_suggestions:
                     st.session_state["new_user_status"] = (
-                        f"Found {len(matched_df)} matched courses for: {course_value}. "
-                        "Please select one exact course below."
+                        f"No matching course suggestions found for: {course_value}"
                     )
-                except Exception as exc:
-                    st.session_state["new_user_status"] = f"Error: {exc}"
                     st.session_state["new_user_matches"] = pd.DataFrame()
                     st.session_state["new_user_exact_choices"] = []
                     st.session_state["new_user_exact_selection"] = None
+                else:
+                    try:
+                        data = post_json("/search-new-user-course", {"query": course_value})
+                        matched_df = to_df(data.get("matched_courses", []))
+                        st.session_state["new_user_matches"] = matched_df
+                        st.session_state["new_user_exact_choices"] = build_exact_course_choices(matched_df)
+                        st.session_state["new_user_exact_selection"] = None
+                        st.session_state["new_user_status"] = (
+                            f"Found {len(matched_df)} matched courses for: {course_value}. "
+                            "Please select one exact course below."
+                        )
+                    except Exception as exc:
+                        st.session_state["new_user_status"] = f"Error: {exc}"
+                        st.session_state["new_user_matches"] = pd.DataFrame()
+                        st.session_state["new_user_exact_choices"] = []
+                        st.session_state["new_user_exact_selection"] = None
 
     with col_reset:
         if st.button("Reset New User Flow", use_container_width=True):
