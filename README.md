@@ -140,7 +140,7 @@ https://online-course-recommendation-systems.streamlit.app/
 .
 ├── app/
 │   ├── main.py
-│   ├── gradio_app.py
+│   ├── streamlit_app.py
 │   └── model/
 │       ├── model2.keras
 │       ├── user_encoder.pkl
