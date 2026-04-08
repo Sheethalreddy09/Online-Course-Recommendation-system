@@ -4,6 +4,8 @@ pydantic
 tensorflow==2.16.1
 pandas
 scikit-learn
+groq
+python-dotenv
 gradio
 requests
 streamlit

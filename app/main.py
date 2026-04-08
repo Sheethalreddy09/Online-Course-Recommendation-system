@@ -1,21 +1,49 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 import tensorflow as tf
+import keras
 import pickle
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from difflib import get_close_matches
+from groq import Groq
 import os
 import re
 import json
 import tempfile
 import zipfile
 
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv():
+        return False
+
+load_dotenv()
+
 app = FastAPI(
     title="Online Course Recommendation API",
     description="Personalized course recommendations using Deep Learning + TF-IDF Retrieval",
     version="3.0.0"
 )
+
+# =====================================================
+# CORS — allow Streamlit frontend to call FastAPI
+# =====================================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =====================================================
+# Groq LLM Client
+# =====================================================
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # =====================================================
 # Paths
@@ -70,7 +98,7 @@ def load_compatible_keras_model(model_path: str):
                     dst_zip.writestr(info, src_zip.read(info.filename))
 
     try:
-        return tf.keras.models.load_model(temp_model_path, compile=False)
+        return keras.models.load_model(temp_model_path, compile=False)
     finally:
         if os.path.exists(temp_model_path):
             os.remove(temp_model_path)
@@ -154,6 +182,16 @@ class CreateNewUserRequest(BaseModel):
     instructor: str
     difficulty_level: str
     rating: float
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    message: str
+    user_id: Optional[int] = None
+    history: Optional[list[ChatMessage]] = []
+    all_retrieved_courses: Optional[list[dict]] = []
 
 # =====================================================
 # Alias Map
@@ -255,13 +293,39 @@ def get_next_new_user_id():
         return base_max + 1
     return max(base_max, int(new_users_df["user_id"].max())) + 1
 
+def extract_difficulty(query: str):
+    """Detect difficulty level keywords in the query."""
+    q = query.lower()
+    if any(w in q for w in ["advanced", "expert", "hard", "difficult"]):
+        return "Advanced"
+    if any(w in q for w in ["intermediate", "medium", "moderate"]):
+        return "Intermediate"
+    if any(w in q for w in ["beginner", "basic", "starter", "easy", "intro", "introduction"]):
+        return "Beginner"
+    return None
+
 def retrieve_courses(query: str, top_n: int = 5):
-    query = normalize_query(query)
-    query_vec = tfidf_vectorizer.transform([query])
-    sim_scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
+    normalized = normalize_query(query)
+
+    # Step 1: Detect difficulty level in query
+    difficulty_filter = extract_difficulty(query)
+
+    # Step 2: Work on filtered subset if difficulty is mentioned
+    if difficulty_filter:
+        filtered_kb = course_kb[course_kb["difficulty_level"] == difficulty_filter].reset_index(drop=True)
+        if filtered_kb.empty:
+            filtered_kb = course_kb.copy().reset_index(drop=True)
+    else:
+        filtered_kb = course_kb.copy().reset_index(drop=True)
+
+    # Step 3: Rebuild TF-IDF on filtered subset
+    filtered_docs = filtered_kb["course_document"].tolist()
+    filtered_matrix = tfidf_vectorizer.transform(filtered_docs)
+    query_vec = tfidf_vectorizer.transform([normalized])
+    sim_scores = cosine_similarity(query_vec, filtered_matrix).flatten()
     top_indices = sim_scores.argsort()[::-1][:top_n]
 
-    results = course_kb.iloc[top_indices][[
+    results = filtered_kb.iloc[top_indices][[
         "course_name",
         "instructor",
         "difficulty_level",
@@ -619,6 +683,138 @@ def create_new_user(request: CreateNewUserRequest):
         },
         "related_recommendations": related_courses
     }
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+    """
+    LLM + RAG Chat endpoint.
+    Flow:
+      1. Retrieve top relevant courses using TF-IDF RAG
+      2. Optionally load user history for personalization
+      3. Build grounded context prompt
+      4. Call Groq LLM (Llama 3) for natural language response
+    """
+    if not groq_client:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM service unavailable. Please set the GROQ_API_KEY environment variable."
+        )
+
+    message = request.message.strip()
+    user_id = request.user_id
+
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    # Step 1: Always retrieve fresh courses for the current query
+    freshly_retrieved = retrieve_courses(message, top_n=5)
+
+    # Step 2: Merge with ALL courses seen in this conversation (deduplicated by course_name+instructor)
+    seen_keys = set()
+    merged_courses = []
+    for c in list(request.all_retrieved_courses) + freshly_retrieved:
+        key = (c.get("course_name", ""), c.get("instructor", ""))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            merged_courses.append(c)
+
+    retrieved = merged_courses
+
+    # Step 2: Build course context from retrieved results
+    course_context = ""
+    for i, course in enumerate(retrieved, 1):
+        course_context += (
+            f"{i}. {course['course_name']}\n"
+            f"   Instructor: {course['instructor']}\n"
+            f"   Difficulty: {course['difficulty_level']}\n"
+            f"   Certification: {course['certification_offered']}\n"
+            f"   Study Material: {course['study_material_available']}\n"
+            f"   Price: ${course['course_price']}\n"
+            f"   Rating: {course['rating']} | Feedback Score: {course['feedback_score']}\n\n"
+        )
+
+    # Step 3: Optionally add user history for personalization
+    # Check both main dataset and new users dataset
+    user_context = ""
+    if user_id is not None:
+        user_row = df[df["user_id"] == user_id]
+        new_user_row = new_users_df[new_users_df["user_id"] == user_id] if not new_users_df.empty else pd.DataFrame()
+
+        if not user_row.empty:
+            taken = (
+                df[df["user_id"] == user_id][["course_name", "difficulty_level", "rating"]]
+                .drop_duplicates()
+            )
+            user_context = f"User ID {user_id} is an existing user. Their past course history:\n"
+            for _, row in taken.iterrows():
+                user_context += f"  - {row['course_name']} ({row['difficulty_level']}, Rating given: {row['rating']})\n"
+            user_context += "\n"
+
+        elif not new_user_row.empty:
+            user_context = f"User ID {user_id} is a new user. Their selected course:\n"
+            for _, row in new_user_row.iterrows():
+                user_context += f"  - {row['course_name']} ({row['difficulty_level']}, Rating given: {row['rating']})\n"
+            user_context += "\n"
+
+        else:
+            user_context = f"User ID {user_id} was provided but not found in the database.\n"
+
+    # Step 4: Build system prompt
+    personalization_block = ""
+    if user_context:
+        personalization_block = f"""
+The user's past course history has already been retrieved from the database and is provided below.
+Use this history to personalize your recommendation — avoid recommending courses they have already taken.
+
+{user_context}"""
+    else:
+        personalization_block = "\nNo user history available. Give a general recommendation based on the query.\n"
+
+    system_prompt = f"""You are CourseGenie, a smart and friendly AI course recommendation assistant.
+Your job is to help users find the best online courses based on their needs.
+
+STRICT RULES:
+- You already have all the data you need below — do NOT say you cannot access user data
+- NEVER EVER deny or contradict your previous responses in the conversation history
+- The conversation history above is the ground truth — always stay consistent with it
+- If you previously listed multiple instructors, REMEMBER them and refer to them when asked
+- If user asks "any other than X" — look at your previous response and suggest the OTHER instructors/courses you already listed
+- If user asks a follow-up — always base your answer on the conversation history AND the retrieved courses below
+- Only recommend courses from the Retrieved Courses Context below
+- Do NOT make up or hallucinate any course names, instructors, or details
+- Be specific, helpful, and conversational
+
+Retrieved Courses Context (from database):
+{course_context}{personalization_block}"""
+
+    # Step 5: Build messages with full conversation history
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # Add previous conversation turns so LLM remembers context
+    if request.history:
+        for turn in request.history:
+            messages.append({"role": turn.role, "content": turn.content})
+
+    # Add current user message
+    messages.append({"role": "user", "content": message})
+
+    # Call Groq LLM
+    groq_response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages,
+        temperature=0.7,
+        max_tokens=512
+    )
+
+    llm_reply = groq_response.choices[0].message.content
+
+    return {
+        "message": message,
+        "user_id": user_id,
+        "retrieved_courses": retrieved,
+        "response": llm_reply
+    }
+
 
 print("Swagger Docs: http://127.0.0.1:8001/docs")
 print("Health Check: http://127.0.0.1:8001/health")

@@ -107,6 +107,17 @@ def post_json(path: str, payload: dict[str, Any], timeout: int = 20) -> dict[str
             return backend.search_new_user_course(backend.SearchRequest(**payload))
         if path == "/create-new-user":
             return backend.create_new_user(backend.CreateNewUserRequest(**payload))
+        if path == "/chat":
+            history_objs = [
+                backend.ChatMessage(role=m["role"], content=m["content"])
+                for m in payload.get("history", [])
+            ]
+            return backend.chat(backend.ChatRequest(
+                message=payload["message"],
+                user_id=payload.get("user_id"),
+                history=history_objs,
+                all_retrieved_courses=payload.get("all_retrieved_courses", [])
+            ))
     except Exception as exc:
         detail = getattr(exc, "detail", str(exc))
         raise RuntimeError(detail) from exc
@@ -169,6 +180,9 @@ def init_state() -> None:
         "search_value": None,
         "new_user_value": None,
         "new_user_exact_selection": None,
+        "chat_messages": [],
+        "chat_user_id": "",
+        "all_retrieved_courses": [],
     }
 
     for key, value in defaults.items():
@@ -469,3 +483,201 @@ with tab_new_user:
         )
 
     st.dataframe(st.session_state["new_user_related"], use_container_width=True)
+
+
+
+# ─────────────────────────────────────────────────────
+# 🧞 CourseGenie Floating Chat Widget
+# ─────────────────────────────────────────────────────
+import streamlit.components.v1 as components
+
+api_url = API_BASE_URL if API_BASE_URL else "http://127.0.0.1:8001"
+
+_widget_js = """
+<script>
+(function() {
+    const API_URL = "API_URL_PLACEHOLDER";
+    let cgHistory = [];
+    let cgAllCourses = [];
+    let cgOpen = false;
+    const doc = window.parent.document;
+
+    // Inject CSS
+    if (!doc.getElementById("cg-style")) {
+        const style = doc.createElement("style");
+        style.id = "cg-style";
+        style.textContent = `
+            #cg-btn {
+                position: fixed; bottom: 28px; right: 28px;
+                width: 62px; height: 62px;
+                background: linear-gradient(135deg, #7C3AED, #4F46E5);
+                border-radius: 50%; cursor: pointer; z-index: 99999;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 28px; box-shadow: 0 4px 16px rgba(124,58,237,0.5);
+                transition: transform 0.2s; border: none; color: white;
+            }
+            #cg-btn:hover { transform: scale(1.1); }
+            #cg-window {
+                position: fixed; bottom: 102px; right: 28px;
+                width: 370px; height: 520px; background: #fff;
+                border-radius: 16px; box-shadow: 0 8px 40px rgba(0,0,0,0.18);
+                z-index: 99998; display: none; flex-direction: column;
+                overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            }
+            #cg-header {
+                background: linear-gradient(135deg, #7C3AED, #4F46E5);
+                color: white; padding: 14px 16px;
+                display: flex; align-items: center; justify-content: space-between;
+                font-weight: 600; font-size: 15px;
+            }
+            #cg-header-left { display: flex; align-items: center; gap: 8px; }
+            #cg-close { background: none; border: none; color: white; font-size: 20px; cursor: pointer; padding: 0; }
+            #cg-userid-bar {
+                padding: 8px 12px; border-bottom: 1px solid #f0f0f0;
+                display: flex; align-items: center; gap: 8px; background: #fafafa;
+            }
+            #cg-userid-bar input {
+                flex: 1; border: 1px solid #ddd; border-radius: 6px;
+                padding: 5px 10px; font-size: 12px; outline: none;
+            }
+            #cg-clear-btn {
+                background: none; border: 1px solid #ddd; border-radius: 6px;
+                padding: 5px 8px; font-size: 11px; cursor: pointer; color: #666;
+            }
+            #cg-clear-btn:hover { background: #fee2e2; color: #dc2626; border-color: #dc2626; }
+            #cg-messages {
+                flex: 1; overflow-y: auto; padding: 12px;
+                display: flex; flex-direction: column; gap: 10px; background: #f9f9fb;
+            }
+            .cg-msg {
+                max-width: 85%; padding: 10px 13px; border-radius: 12px;
+                font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+            }
+            .cg-user {
+                background: linear-gradient(135deg, #7C3AED, #4F46E5);
+                color: white; align-self: flex-end; border-bottom-right-radius: 3px;
+            }
+            .cg-assistant {
+                background: white; color: #1a1a1a; align-self: flex-start;
+                border-bottom-left-radius: 3px; box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+            }
+            .cg-typing {
+                background: white; color: #888; align-self: flex-start;
+                font-style: italic; font-size: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+            }
+            #cg-input-area {
+                display: flex; padding: 10px 12px; gap: 8px;
+                border-top: 1px solid #eee; background: white;
+            }
+            #cg-input {
+                flex: 1; border: 1px solid #ddd; border-radius: 20px;
+                padding: 8px 14px; font-size: 13px; outline: none;
+            }
+            #cg-input:focus { border-color: #7C3AED; }
+            #cg-send {
+                background: linear-gradient(135deg, #7C3AED, #4F46E5);
+                color: white; border: none; border-radius: 50%;
+                width: 36px; height: 36px; cursor: pointer; font-size: 16px;
+                display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+            }
+        `;
+        doc.head.appendChild(style);
+    }
+
+    // Inject HTML
+    if (!doc.getElementById("cg-btn")) {
+        const wrapper = doc.createElement("div");
+        wrapper.innerHTML = `
+            <button id="cg-btn" title="Ask CourseGenie">&#129502;</button>
+            <div id="cg-window">
+                <div id="cg-header">
+                    <div id="cg-header-left"><span>&#129502;</span><span>CourseGenie</span></div>
+                    <button id="cg-close">&#x2715;</button>
+                </div>
+                <div id="cg-userid-bar">
+                    <input id="cg-userid" type="text" placeholder="User ID (optional)" />
+                    <button id="cg-clear-btn">&#128465; Clear</button>
+                </div>
+                <div id="cg-messages">
+                    <div class="cg-msg cg-assistant">Hi! I am CourseGenie &#129502; Ask me anything about courses!</div>
+                </div>
+                <div id="cg-input-area">
+                    <input id="cg-input" type="text" placeholder="Ask about courses..." />
+                    <button id="cg-send">&#10148;</button>
+                </div>
+            </div>
+        `;
+        doc.body.appendChild(wrapper);
+
+        function toggleCG() {
+            cgOpen = !cgOpen;
+            doc.getElementById("cg-window").style.display = cgOpen ? "flex" : "none";
+            if (cgOpen) doc.getElementById("cg-input").focus();
+        }
+
+        function clearCG() {
+            cgHistory = []; cgAllCourses = [];
+            doc.getElementById("cg-messages").innerHTML =
+                '<div class="cg-msg cg-assistant">Hi! I am CourseGenie &#129502; Ask me anything about courses!</div>';
+        }
+
+        function addMsg(role, text) {
+            const msgs = doc.getElementById("cg-messages");
+            const div = doc.createElement("div");
+            div.className = "cg-msg cg-" + role;
+            div.textContent = text;
+            msgs.appendChild(div);
+            msgs.scrollTop = msgs.scrollHeight;
+            return div;
+        }
+
+        async function sendCG() {
+            const input = doc.getElementById("cg-input");
+            const message = input.value.trim();
+            if (!message) return;
+            input.value = ""; input.disabled = true;
+            addMsg("user", message);
+            const typing = addMsg("typing", "CourseGenie is thinking...");
+            const uid = doc.getElementById("cg-userid").value.trim();
+            const payload = { message: message, history: [...cgHistory], all_retrieved_courses: [...cgAllCourses] };
+            if (uid && !isNaN(uid)) payload.user_id = parseInt(uid);
+            cgHistory.push({ role: "user", content: message });
+            try {
+                const resp = await fetch(API_URL + "/chat", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                });
+                const data = await resp.json();
+                typing.remove();
+                const reply = data.response || "Sorry, no response.";
+                addMsg("assistant", reply);
+                cgHistory.push({ role: "assistant", content: reply });
+                if (data.retrieved_courses) {
+                    const seen = new Set(cgAllCourses.map(c => c.course_name + "|" + c.instructor));
+                    for (const c of data.retrieved_courses) {
+                        const key = c.course_name + "|" + c.instructor;
+                        if (!seen.has(key)) { cgAllCourses.push(c); seen.add(key); }
+                    }
+                }
+            } catch(e) {
+                typing.remove();
+                addMsg("assistant", "Error connecting to backend. Make sure the API is running.");
+            }
+            input.disabled = false; input.focus();
+        }
+
+        doc.getElementById("cg-btn").addEventListener("click", toggleCG);
+        doc.getElementById("cg-close").addEventListener("click", toggleCG);
+        doc.getElementById("cg-clear-btn").addEventListener("click", clearCG);
+        doc.getElementById("cg-send").addEventListener("click", sendCG);
+        doc.getElementById("cg-input").addEventListener("keypress", function(e) {
+            if (e.key === "Enter") sendCG();
+        });
+    }
+})();
+</script>
+"""
+
+_widget_js = _widget_js.replace("API_URL_PLACEHOLDER", api_url)
+components.html(_widget_js, height=0)
