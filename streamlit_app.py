@@ -4,9 +4,22 @@ from typing import Any
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 
-API_BASE_URL = os.getenv("API_BASE_URL", "").strip()
+API_REQUEST_TIMEOUT = 30
+DEFAULT_LOCAL_API_BASE_URL = "http://127.0.0.1:8001"
+BACKEND_WAKEUP_MESSAGE = (
+    "Backend is waking up on Render, please wait a few seconds and try again."
+)
+
+
+def normalize_api_base_url(raw_url: str) -> str:
+    cleaned = raw_url.strip().strip('"').strip("'").strip()
+    return cleaned.rstrip("/")
+
+
+API_BASE_URL = normalize_api_base_url(os.getenv("API_BASE_URL", ""))
 
 
 def beautify_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -37,28 +50,20 @@ def to_df(data: Any) -> pd.DataFrame:
 
 
 @st.cache_resource(show_spinner=False)
+def load_inprocess_backend():
+    from app import main as backend_module
+    return backend_module
+
+
 def get_backend() -> dict[str, Any]:
     if API_BASE_URL:
-        try:
-            response = requests.get(f"{API_BASE_URL}/health", timeout=5)
-            response.raise_for_status()
-            data = response.json()
-            return {
-                "mode": "api",
-                "message": (
-                    f"Backend Connected via API | Status: {data.get('status')} | "
-                    f"Model: {data.get('model')}"
-                ),
-            }
-        except Exception as exc:
-            return {
-                "mode": "error",
-                "message": f"Configured API backend is not reachable at {API_BASE_URL}. Error: {exc}",
-            }
+        return {
+            "mode": "api",
+            "base_url": API_BASE_URL,
+        }
 
     try:
-        from app import main as backend_module
-
+        backend_module = load_inprocess_backend()
         data = backend_module.health_check()
         return {
             "mode": "inprocess",
@@ -75,19 +80,47 @@ def get_backend() -> dict[str, Any]:
         }
 
 
-def backend_health(backend_info: dict[str, Any]) -> tuple[bool, str]:
-    if backend_info["mode"] in {"api", "inprocess"}:
-        return True, backend_info["message"]
-    return False, backend_info["message"]
+@st.cache_data(show_spinner=False, ttl=15)
+def check_api_health(base_url: str) -> tuple[str, str]:
+    try:
+        response = requests.get(f"{base_url}/health", timeout=API_REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        return (
+            "success",
+            (
+                f"Backend Connected via API | Status: {data.get('status')} | "
+                f"Model: {data.get('model')}"
+            ),
+        )
+    except requests.exceptions.Timeout:
+        return ("warning", BACKEND_WAKEUP_MESSAGE)
+    except requests.exceptions.RequestException:
+        return ("warning", BACKEND_WAKEUP_MESSAGE)
 
 
-def post_json(path: str, payload: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
+def backend_health(backend_info: dict[str, Any]) -> tuple[str, str]:
+    if backend_info["mode"] == "api":
+        return check_api_health(backend_info["base_url"])
+    if backend_info["mode"] == "inprocess":
+        return "success", backend_info["message"]
+    return "error", backend_info["message"]
+
+
+def post_json(path: str, payload: dict[str, Any], timeout: int = API_REQUEST_TIMEOUT) -> dict[str, Any]:
     backend_info = get_backend()
 
     if backend_info["mode"] == "api":
-        response = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=timeout)
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = requests.post(
+                f"{backend_info['base_url']}{path}",
+                json=payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout as exc:
+            raise RuntimeError(BACKEND_WAKEUP_MESSAGE) from exc
 
     if backend_info["mode"] != "inprocess":
         raise RuntimeError(backend_info["message"])
@@ -130,7 +163,7 @@ def get_user_suggestions(prefix: str) -> list[str]:
     if not prefix:
         return []
     try:
-        data = post_json("/suggest-users", {"prefix": prefix}, timeout=10)
+        data = post_json("/suggest-users", {"prefix": prefix}, timeout=API_REQUEST_TIMEOUT)
         return data.get("suggestions", [])
     except Exception:
         return []
@@ -141,7 +174,7 @@ def get_course_suggestions(prefix: str) -> list[str]:
     if not prefix:
         return []
     try:
-        data = post_json("/suggest-courses", {"prefix": prefix}, timeout=10)
+        data = post_json("/suggest-courses", {"prefix": prefix}, timeout=API_REQUEST_TIMEOUT)
         return data.get("suggestions", [])
     except Exception:
         return []
@@ -228,16 +261,17 @@ if st.session_state["pending_existing_user_input"] is not None:
     st.session_state["pending_existing_user_input"] = None
 
 backend_info = get_backend()
-healthy, health_message = backend_health(backend_info)
+health_state, health_message = backend_health(backend_info)
 
 st.title("Online Course Recommendation System")
 st.caption("Enhanced Embedding + Smart Search + New User Onboarding")
 
-if healthy:
+if health_state == "success":
     st.success(health_message)
+elif health_state == "warning":
+    st.warning(health_message)
 else:
     st.error(health_message)
-    st.stop()
 
 tab_existing, tab_search, tab_new_user = st.tabs(
     ["Existing User Recommendation", "Course Search", "New User Onboarding"]
@@ -485,13 +519,7 @@ with tab_new_user:
     st.dataframe(st.session_state["new_user_related"], use_container_width=True)
 
 
-
-# ─────────────────────────────────────────────────────
-# 🧞 CourseGenie Floating Chat Widget
-# ─────────────────────────────────────────────────────
-import streamlit.components.v1 as components
-
-api_url = API_BASE_URL if API_BASE_URL else "http://127.0.0.1:8001"
+chat_api_url = API_BASE_URL if API_BASE_URL else DEFAULT_LOCAL_API_BASE_URL
 
 _widget_js = """
 <script>
@@ -502,7 +530,6 @@ _widget_js = """
     let cgOpen = false;
     const doc = window.parent.document;
 
-    // Inject CSS
     if (!doc.getElementById("cg-style")) {
         const style = doc.createElement("style");
         style.id = "cg-style";
@@ -584,7 +611,6 @@ _widget_js = """
         doc.head.appendChild(style);
     }
 
-    // Inject HTML
     if (!doc.getElementById("cg-btn")) {
         const wrapper = doc.createElement("div");
         wrapper.innerHTML = `
@@ -616,7 +642,8 @@ _widget_js = """
         }
 
         function clearCG() {
-            cgHistory = []; cgAllCourses = [];
+            cgHistory = [];
+            cgAllCourses = [];
             doc.getElementById("cg-messages").innerHTML =
                 '<div class="cg-msg cg-assistant">Hi! I am CourseGenie &#129502; Ask me anything about courses!</div>';
         }
@@ -635,13 +662,22 @@ _widget_js = """
             const input = doc.getElementById("cg-input");
             const message = input.value.trim();
             if (!message) return;
-            input.value = ""; input.disabled = true;
+
+            input.value = "";
+            input.disabled = true;
             addMsg("user", message);
             const typing = addMsg("typing", "CourseGenie is thinking...");
+
             const uid = doc.getElementById("cg-userid").value.trim();
-            const payload = { message: message, history: [...cgHistory], all_retrieved_courses: [...cgAllCourses] };
+            const payload = {
+                message: message,
+                history: [...cgHistory],
+                all_retrieved_courses: [...cgAllCourses]
+            };
             if (uid && !isNaN(uid)) payload.user_id = parseInt(uid);
+
             cgHistory.push({ role: "user", content: message });
+
             try {
                 const resp = await fetch(API_URL + "/chat", {
                     method: "POST",
@@ -650,21 +686,28 @@ _widget_js = """
                 });
                 const data = await resp.json();
                 typing.remove();
+
                 const reply = data.response || "Sorry, no response.";
                 addMsg("assistant", reply);
                 cgHistory.push({ role: "assistant", content: reply });
+
                 if (data.retrieved_courses) {
                     const seen = new Set(cgAllCourses.map(c => c.course_name + "|" + c.instructor));
                     for (const c of data.retrieved_courses) {
                         const key = c.course_name + "|" + c.instructor;
-                        if (!seen.has(key)) { cgAllCourses.push(c); seen.add(key); }
+                        if (!seen.has(key)) {
+                            cgAllCourses.push(c);
+                            seen.add(key);
+                        }
                     }
                 }
-            } catch(e) {
+            } catch (e) {
                 typing.remove();
-                addMsg("assistant", "Error connecting to backend. Make sure the API is running.");
+                addMsg("assistant", "Backend is waking up on Render, please wait a few seconds and try again.");
             }
-            input.disabled = false; input.focus();
+
+            input.disabled = false;
+            input.focus();
         }
 
         doc.getElementById("cg-btn").addEventListener("click", toggleCG);
@@ -679,5 +722,5 @@ _widget_js = """
 </script>
 """
 
-_widget_js = _widget_js.replace("API_URL_PLACEHOLDER", api_url)
+_widget_js = _widget_js.replace("API_URL_PLACEHOLDER", chat_api_url)
 components.html(_widget_js, height=0)
